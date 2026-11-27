@@ -30,6 +30,25 @@ DEFAULT_POLICY = {key: 0 for key in METRICS}
 class InputError(ValueError):
     """Unsupported, malformed or over-budget input."""
 
+_WINDOWS = os.name == "nt"
+
+def _same_file_cross_api(a, b):
+    if not stat.S_ISREG(a.st_mode) or not stat.S_ISREG(b.st_mode):
+        return False
+    if any(getattr(x, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) for x in (a,b)):
+        return False
+    if not a.st_ino or not b.st_ino:
+        return False
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if any(getattr(a,k) != getattr(b,k) for k in fields):
+        return False
+    if not _WINDOWS:
+        return a.st_ctime_ns == b.st_ctime_ns
+    # Windows Python >=3.12: compare creation time explicitly, not ctime.
+    birth_a = getattr(a, "st_birthtime_ns", None)
+    birth_b = getattr(b, "st_birthtime_ns", None)
+    return birth_a is not None and birth_a == birth_b
+
 def open_regular(path, limit):
     """Return a bounded local bytes snapshot; refuse special files and final links."""
     def identity(info):
@@ -43,12 +62,12 @@ def open_regular(path, limit):
                  getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
     with os.fdopen(fd, "rb") as f:
         opened = os.fstat(f.fileno())
-        if identity(opened) != identity(before):
+        if not _same_file_cross_api(before, opened) or (not _WINDOWS and identity(opened) != identity(before)):
             raise InputError("file changed before read")
         data = f.read(opened.st_size + 1)
         final = os.fstat(f.fileno())
         named = os.lstat(path)
-        if len(data) != opened.st_size or identity(final) != identity(opened) or identity(named) != identity(opened):
+        if len(data) != opened.st_size or identity(final) != identity(opened) or identity(named) != identity(before) or not _same_file_cross_api(named, final):
             raise InputError("file changed during read")
     return io.BytesIO(data)
 
